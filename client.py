@@ -1,12 +1,8 @@
-import os
-from datetime import timedelta
-from datetime import datetime
-
+import functools
 import logging
 import json
-from regex import regex
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Updater,
     CallbackQueryHandler,
@@ -15,22 +11,56 @@ from telegram.ext import (
     Filters,
 )
 
-import sql_observer
-
 from datetime import datetime
-
+from datetime import timedelta
 from urllib.parse import urlencode
 from urllib.request import urlopen
-
 from multiprocessing import Process
 
+import os
+
+import sql_observer
 from generate_plot import generate_plot
+
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    List,
+    Optional,
+    Tuple,
+    TypeVar,
+    Union,
+    no_type_check,
+    Dict,
+    cast,
+    Sequence,
+)
 
 BASE_URL = 'https://openexchangerates.org/api'
 ENDPOINT_LATEST = BASE_URL + '/latest.json'
 ENDPOINT_HISTORICAL = BASE_URL + '/historical/%s.json'
 
 
+RT = TypeVar('RT')
+
+
+def log(
+    func: Callable[..., RT], *args: object, **kwargs: object  # pylint: disable=W0613
+) -> Callable[..., RT]:
+    logger = logging.getLogger(func.__module__)
+
+    @functools.wraps(func)
+    def decorator(*args: object, **kwargs: object) -> RT:  # pylint: disable=W0613
+        logger.debug('Entering: %s', func.__name__)
+        result = func(*args, **kwargs)
+        logger.debug(result)
+        logger.debug('Exiting: %s', func.__name__)
+        return result
+
+    return decorator
+
+
+@log
 def exchange(balance, rate, converse=False):
     if rate != 0:
         return round(balance * (rate if converse else 1/rate), 3)
@@ -53,7 +83,6 @@ def get_rate(time="", name="", base="USD", timeout=10):
         url = (f"{ENDPOINT_HISTORICAL % time}?"
                f"{urlencode({'app_id': api_key, 'base': base, 'symbols': name})}")
 
-    # https://openexchangerates.org/api/historical/2021-04-07.json?app_id=59f4274a5fb741769910d06a3885ed44&symbols=CAD
     response = urlopen(url, timeout=timeout).read()
     return json.loads(response)['rates']
 
@@ -61,19 +90,15 @@ def get_rate(time="", name="", base="USD", timeout=10):
 def show_details(update, context):
     query = update.callback_query
 
-    # CallbackQueries need to be answered, even if no notification to the user is needed
-    # Some clients may have trouble otherwise. See https://core.telegram.org/bots/api#callbackquery
-    # query.answer()
     if query.data == "0":
         context.bot.answer_callback_query(update.callback_query.id,
                                           text="No exchange rate data is available for the selected currency.",
                                           show_alert=True)
     elif query.data:
-
         with open(query.data + ".png", "rb") as f:
             context.bot.send_photo(chat_id=update.effective_chat.id, photo=f)
     query.delete_message()
-    # query.answer()
+    query.answer()
 
 
 def get_latest():
@@ -124,6 +149,9 @@ def send_error(update, context, error="Error"):
 
 
 def help_command(update, context):
+    """
+        Sends help text
+    """
     if update.edited_message:
         return
 
@@ -141,6 +169,9 @@ def help_command(update, context):
 
 
 def list_command(update, context):
+    """
+        Sends latest rates
+    """
     if update.edited_message:
         return
 
@@ -151,7 +182,10 @@ def list_command(update, context):
     context.bot.send_message(chat_id=update.effective_chat.id, text=message)
 
 
-def send_converted(message, update, context):
+def send_converted_value(message, update, context):
+    """
+        Returns converted r"USD/EUR" to ("USD", "EUR") or sends error text & returns False
+    """
     split_message = message.split()
 
     value = get_value(split_message[1], update, context)
@@ -165,16 +199,17 @@ def send_converted(message, update, context):
         if currency["currency"] != " ":
             converted_value = exchange(value, currency["rate"], currency["converse"])
             context.bot.send_message(chat_id=update.effective_chat.id,
-                                     text=converted_value)
+                                     text=f"{converted_value} {currency['currency']}")
         else:
-            context.bot.send_message(chat_id=update.effective_chat.id,
-                                     text="There is no entered currency")
+            send_error(update, context, "There is no entered currency")
     else:
-        context.bot.send_message(chat_id=update.effective_chat.id,
-                                 text="You should use base currency '$' or 'USD' to exchange successful")
+        send_error(update, context, "You should use base currency '$' or 'USD' to exchange successful")
 
 
 def exchange_command(update, context):
+    """
+        Returns converted r"USD/EUR" to ("USD", "EUR") or sends error text & returns False
+    """
     if update.edited_message:
         return
 
@@ -183,18 +218,18 @@ def exchange_command(update, context):
     message = update.message.text
 
     if "\n" in message:
-        context.bot.send_message(chat_id=update.effective_chat.id,
-                                 text="You should enter data without enters")
-        return
+        return send_error(update, context, "You should enter data without enters")
 
     if 4 <= len(update.message.text.split()) <= 5:
-        send_converted(message, update, context)
+        send_converted_value(message, update, context)
     else:
-        context.bot.send_message(chat_id=update.effective_chat.id,
-                                 text="Use this format: /exchange [$10] to [CAD] or /exchange [10] [USD] to [CAD]")
+        send_error(update, context, "Use this format: /exchange [$10] to [CAD] or /exchange [10] [USD] to [CAD]")
 
 
 def get_split_name(name, update, context):
+    """
+        Returns converted r"USD/EUR" to ["USD", "EUR"] or sends error text & returns False
+    """
     split_name = name.split("/")
     if len(split_name) != 2 or not split_name[0] or not split_name[1]:
         return send_error(update, context, "Use this format: /history [USD]/[CAD] for [7] days")
@@ -281,12 +316,12 @@ def history_command(update, context):
 
     if len(split_message) == 5:
         send_graph(split_message, update, context)
-
     else:
         return send_error(update, context, "Use this format: /history [USD]/[CAD] for [7] days")
 
 
 def main():
+    logging.warning("Bot is running")
     token = os.environ['token']
     # with open("settings.json", "r") as r:
     #     token = json.load(r)["token"]
@@ -295,31 +330,26 @@ def main():
 
     dispatcher = updater.dispatcher
 
-    dispatcher.add_handler(CallbackQueryHandler(show_details))
-    dispatcher.add_handler(CommandHandler('help', help_command))
     dispatcher.add_handler(CommandHandler('start', help_command))
+    dispatcher.add_handler(CommandHandler('help', help_command))
+    # /start or /help
 
     dispatcher.add_handler(CommandHandler('list', list_command))
     dispatcher.add_handler(CommandHandler('lst', list_command))
-    # /list or /lst - returns list of all available rates
+    # /list or /lst
 
     dispatcher.add_handler(CommandHandler('exchange', exchange_command))
-    # /exchange $10 to CAD or /exchange 10 USD to CAD
+    # /exchange
 
     dispatcher.add_handler(CommandHandler('history', history_command))
-    # /history USD/CAD for 7 days
+    dispatcher.add_handler(CallbackQueryHandler(show_details))
+    # /history
 
     dispatcher.add_handler(MessageHandler(Filters.text & (~Filters.command), help_command))
     # /help
 
-    # Start the Bot
     logging.warning("Bot is starting")
     updater.start_polling()
-
-    # Run the bot until you press Ctrl-C or the process receives SIGINT,
-    # SIGTERM or SIGABRT. This should be used most of the time, since
-    # start_polling() is non-blocking and will stop the bot gracefully.
-    logging.warning("Bot is idling")
     updater.idle()
 
 
